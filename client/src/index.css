@@ -1,0 +1,100 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400&family=Outfit:wght@300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: 'DM Sans', sans-serif;
+  --font-display: 'Outfit', sans-serif;
+
+  /* Deep Space Theme */
+  --background: 222 47% 7%;
+  --foreground: 210 40% 98%;
+  
+  --card: 222 47% 11%;
+  --card-foreground: 210 40% 98%;
+  
+  --popover: 222 47% 11%;
+  --popover-foreground: 210 40% 98%;
+  
+  /* Neon Cyan Primary */
+  --primary: 190 90% 50%;
+  --primary-foreground: 222 47% 11%;
+  
+  /* Electric Purple Secondary */
+  --secondary: 280 90% 60%;
+  --secondary-foreground: 210 40% 98%;
+  
+  --muted: 217 32% 17%;
+  --muted-foreground: 215 20% 65%;
+  
+  /* Bright Pink/Red Accent */
+  --accent: 330 90% 60%;
+  --accent-foreground: 210 40% 98%;
+  
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 98%;
+
+  --border: 217 32% 17%;
+  --input: 217 32% 17%;
+  --ring: 190 90% 50%;
+
+  --radius: 0.75rem;
+
+  /* Chart Colors */
+  --chart-1: 190 90% 50%; /* Cyan */
+  --chart-2: 280 90% 60%; /* Purple */
+  --chart-3: 330 90% 60%; /* Pink */
+  --chart-4: 45 90% 50%;  /* Gold */
+  --chart-5: 140 70% 50%; /* Green */
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    background-image: 
+      radial-gradient(circle at 15% 50%, rgba(0, 240, 255, 0.05), transparent 25%),
+      radial-gradient(circle at 85% 30%, rgba(176, 38, 255, 0.05), transparent 25%);
+    background-attachment: fixed;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    @apply font-bold tracking-tight;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-card/60 backdrop-blur-xl border border-white/10 shadow-2xl shadow-black/50;
+  }
+  
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary via-secondary to-accent;
+  }
+
+  .hover-glow {
+    @apply transition-all duration-300;
+  }
+  .hover-glow:hover {
+    @apply shadow-[0_0_20px_rgba(0,240,255,0.4)] border-primary/50;
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: hsl(var(--background));
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted));
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground));
+}

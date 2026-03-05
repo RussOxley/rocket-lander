@@ -1,13 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from "react";
-
-function useIsMobile(breakpoint = 640) {
-  const subscribe = useCallback((cb) => {
-    window.addEventListener("resize", cb);
-    return () => window.removeEventListener("resize", cb);
-  }, []);
-  const getSnapshot = useCallback(() => window.innerWidth < breakpoint, [breakpoint]);
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
-}
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 
 const W = 720;
 const H = 520;
@@ -23,12 +14,13 @@ const DRAG_X = 0.997;
 const DRAG_Y = 0.998;
 const MAX_TILT = 0.2;
 
-const MAX_ROUNDS = 15;
+const MAX_ROUNDS = 10;
 const START_WEALTH = 10000;
 const BASE_RISK_FREE_RATE = 0.016;
 const MIN_RISK_FREE_RATE = 0.004;
 const PAD_EDGE_BASE = [0.010, 0.006, 0.003];
 const PAD_EDGE_FLOOR = [0.004, 0.002, 0.0008];
+const MARKET_BOOK_KEY = "rocket_lander_market_book_v1";
 const MARKET_PRIOR_STRENGTH = 30;
 const ACTION_TAU_FRAC = 0.026;
 const BANKRUPT_FLOOR = 100;
@@ -68,10 +60,10 @@ const DIFF_TIERS = [
   { gravity: 0.014, fuel: 92, wind: 0.50, label: "Breezy Conditions" },
   { gravity: 0.017, fuel: 85, wind: 0.70, label: "Gusty Approach" },
   { gravity: 0.019, fuel: 78, wind: 0.90, label: "Turbulent Descent" },
-  { gravity: 0.021, fuel: 72, wind: 1.40, label: "Heavy Crosswind" },
-  { gravity: 0.023, fuel: 65, wind: 1.65, label: "Storm Approach" },
-  { gravity: 0.025, fuel: 60, wind: 1.90, label: "Severe Turbulence" },
-  { gravity: 0.026, fuel: 56, wind: 2.20, label: "Hurricane Landing" },
+  { gravity: 0.022, fuel: 70, wind: 1.10, label: "Heavy Crosswind" },
+  { gravity: 0.025, fuel: 62, wind: 1.30, label: "Storm Approach" },
+  { gravity: 0.028, fuel: 55, wind: 1.60, label: "Severe Turbulence" },
+  { gravity: 0.031, fuel: 48, wind: 1.80, label: "Hurricane Landing" },
 ];
 
 const START_Y = [20, 20, 18, 18, 17, 17, 16, 16, 15, 14];
@@ -261,8 +253,8 @@ function updateSkill(prior, impliedSkill, noiseVar = 0.12) {
 
 function tierSeverity(tierIdx) {
   const tier = DIFF_TIERS[tierIdx];
-  const gNorm = (tier.gravity - 0.008) / (0.026 - 0.008);
-  const windNorm = tier.wind / 2.2;
+  const gNorm = (tier.gravity - 0.008) / (0.031 - 0.008);
+  const windNorm = tier.wind / 1.8;
   const fuelNorm = 1 - tier.fuel / 110;
   return clamp(0.45 * (tierIdx / 9) + 0.30 * windNorm + 0.15 * gNorm + 0.10 * fuelNorm, 0, 1);
 }
@@ -284,11 +276,12 @@ function createEmptyMarketBook() {
   );
 }
 
-async function fetchMarketBookFromDB() {
+function loadMarketBook() {
+  if (typeof window === "undefined") return createEmptyMarketBook();
   try {
-    const res = await fetch(`/api/market-book?tiers=${DIFF_TIERS.length}&pads=${PADS.length}`);
-    if (!res.ok) return createEmptyMarketBook();
-    const parsed = await res.json();
+    const raw = window.localStorage.getItem(MARKET_BOOK_KEY);
+    if (!raw) return createEmptyMarketBook();
+    const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed) || parsed.length !== DIFF_TIERS.length) return createEmptyMarketBook();
     return parsed.map((row) =>
       Array.isArray(row) && row.length === PADS.length
@@ -301,6 +294,13 @@ async function fetchMarketBookFromDB() {
   } catch {
     return createEmptyMarketBook();
   }
+}
+
+function saveMarketBook(book) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(MARKET_BOOK_KEY, JSON.stringify(book));
+  } catch {}
 }
 
 function totalLocalMarketObservations(book) {
@@ -325,92 +325,12 @@ function quotedProfitMult(qQuote, riskFreeRate, promoEdge) {
   return (1 + riskFreeRate + promoEdge) / q - 1;
 }
 
-function isotonicDecreasing(arr) {
-  const out = arr.slice();
-  const n = out.length;
-  const weight = new Float64Array(n).fill(1);
-  let merged = true;
-  while (merged) {
-    merged = false;
-    for (let i = 0; i < n - 1; i++) {
-      if (out[i] < out[i + 1]) {
-        const w = weight[i] + weight[i + 1];
-        const avg = (out[i] * weight[i] + out[i + 1] * weight[i + 1]) / w;
-        out[i] = avg;
-        out[i + 1] = avg;
-        weight[i] = w;
-        weight[i + 1] = w;
-        merged = true;
-      }
-    }
-  }
-  return out;
-}
-
-function buildSmoothedGrid(book) {
-  const nT = DIFF_TIERS.length;
-  const nP = PADS.length;
-
-  let weightedLogitSum = 0, weightedLogitDenom = 0;
-  for (let t = 0; t < nT; t++) {
-    for (let p = 0; p < nP; p++) {
-      const cell = book?.[t]?.[p] || { s: 0, f: 0 };
-      const n = (cell.s || 0) + (cell.f || 0);
-      if (n > 0) {
-        const priorQ = estimateSuccess(t, p, 0.5);
-        const empirical = (cell.s + 1) / (n + 2);
-        const residual = Math.log(empirical / (1 - empirical)) - Math.log(priorQ / (1 - priorQ));
-        weightedLogitSum += residual * n;
-        weightedLogitDenom += n;
-      }
-    }
-  }
-
-  const offsetScale = weightedLogitDenom > 0
-    ? weightedLogitDenom / (weightedLogitDenom + MARKET_PRIOR_STRENGTH)
-    : 0;
-  const globalOffset = weightedLogitDenom > 0
-    ? (weightedLogitSum / weightedLogitDenom) * offsetScale
-    : 0;
-
-  const raw = Array.from({ length: nT }, (_, t) =>
-    Array.from({ length: nP }, (_, p) => {
-      const cell = book?.[t]?.[p] || { s: 0, f: 0 };
-      const n = (cell.s || 0) + (cell.f || 0);
-      const priorQ = estimateSuccess(t, p, 0.5);
-      const priorLogit = Math.log(priorQ / (1 - priorQ));
-      const adjustedLogit = priorLogit + globalOffset;
-
-      if (n === 0) {
-        return sigmoid(adjustedLogit);
-      }
-
-      const empiricalQ = (cell.s + 0.5) / (n + 1);
-      const dataWeight = n / (n + MARKET_PRIOR_STRENGTH);
-      return (1 - dataWeight) * sigmoid(adjustedLogit) + dataWeight * empiricalQ;
-    })
-  );
-
-  for (let p = 0; p < nP; p++) {
-    const col = raw.map(row => row[p]);
-    const mono = isotonicDecreasing(col);
-    for (let t = 0; t < nT; t++) raw[t][p] = mono[t];
-  }
-
-  for (let t = 0; t < nT; t++) {
-    const row = raw[t];
-    const mono = isotonicDecreasing(row);
-    for (let p = 0; p < nP; p++) raw[t][p] = mono[p];
-  }
-
-  return raw.map(row => row.map(q => clamp(q, 0.04, 0.96)));
-}
-
-function marketPosteriorProb(smoothedGrid, tierIdx, padIdx) {
-  if (smoothedGrid?.[tierIdx]?.[padIdx] != null) {
-    return smoothedGrid[tierIdx][padIdx];
-  }
-  return clamp(estimateSuccess(tierIdx, padIdx, 0.5), 0.04, 0.96);
+function marketPosteriorProb(book, tierIdx, padIdx) {
+  const cell = book?.[tierIdx]?.[padIdx] || { s: 0, f: 0 };
+  const priorQ = estimateSuccess(tierIdx, padIdx, 0.5);
+  const alpha = priorQ * MARKET_PRIOR_STRENGTH + (cell.s || 0);
+  const beta = (1 - priorQ) * MARKET_PRIOR_STRENGTH + (cell.f || 0);
+  return clamp(alpha / (alpha + beta), 0.04, 0.96);
 }
 
 function marketQuote({ marketBook, tierIdx, padIdx, skillMu, skillSigma2 }) {
@@ -418,23 +338,22 @@ function marketQuote({ marketBook, tierIdx, padIdx, skillMu, skillSigma2 }) {
   const qPersonal = estimateSuccess(tierIdx, padIdx, skillMu);
   const clarity = skillClarity(skillSigma2);
   const personalWeight = clamp(
-    0.10 + 0.72 * clarity + 0.26 * Math.abs(skillMu - 0.5) * 2,
-    0.10,
-    0.96
+    0.12 + 0.58 * clarity + 0.18 * Math.abs(skillMu - 0.5) * 2,
+    0.12,
+    0.86
   );
   const qQuote = clamp((1 - personalWeight) * qBook + personalWeight * qPersonal, 0.04, 0.96);
   const riskFreeRate = roundRiskFreeRate(tierIdx);
   const baseEdge = PAD_EDGE_BASE[padIdx];
-  const skillPressure = clamp(0.88 * clarity + 0.38 * Math.max(0, skillMu - 0.5) * 2, 0, 1.3);
-  const skillSurcharge = clamp((clarity - 0.40) * Math.max(0, skillMu - 0.52) * 0.10, 0, 0.020);
-  const promoEdge = clamp(baseEdge * (1 - skillPressure) - skillSurcharge, -0.015, baseEdge);
+  const floorEdge = PAD_EDGE_FLOOR[padIdx];
+  const skillPressure = clamp(0.72 * clarity + 0.20 * Math.max(0, skillMu - 0.5) * 2, 0, 0.92);
+  const promoEdge = clamp(Math.max(floorEdge, baseEdge * (1 - skillPressure)), floorEdge, baseEdge);
   return {
     qBook,
     qPersonal,
     qQuote,
     riskFreeRate,
     promoEdge,
-    skillSurcharge,
     profitMult: quotedProfitMult(qQuote, riskFreeRate, promoEdge),
     personalWeight,
     clarity,
@@ -472,9 +391,7 @@ function economicPreview({ wealth, tierIdx, padIdx, betFrac, skillMu, skillSigma
   const quote = marketQuote({ marketBook, tierIdx, padIdx, skillMu, skillSigma2 });
   const bet = Math.round(wealth * betFrac);
   const cash = wealth - bet;
-  const fuelSkillDiscount = clamp(quote.clarity * Math.max(0, skillMu - 0.5) * 1.2, 0, 0.7);
-  const effectiveFuelCap = PADS[padIdx].fuelBonusCapPct * (1 - fuelSkillDiscount);
-  const expectedBonusPct = effectiveFuelCap * expectedFuelLeftFrac(tierIdx, padIdx, skillMu);
+  const expectedBonusPct = PADS[padIdx].fuelBonusCapPct * expectedFuelLeftFrac(tierIdx, padIdx, skillMu);
   const failWealth = Math.round(cash * (1 + quote.riskFreeRate));
   const successWealth = Math.round(cash * (1 + quote.riskFreeRate) + bet * (1 + quote.profitMult));
   const expectedSuccessWithFuel = Math.round(successWealth + bet * expectedBonusPct);
@@ -566,19 +483,12 @@ function getEdgeProfile(edge) {
 }
 
 function genRoundOrder() {
-  const tiers = Array.from({ length: DIFF_TIERS.length }, (_, i) => i);
-  const midTiers = [3, 4, 5, 6, 7];
-  for (let i = midTiers.length - 1; i > 0; i--) {
+  const mid = [1, 2, 3, 4, 5, 6, 7, 8];
+  for (let i = mid.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [midTiers[i], midTiers[j]] = [midTiers[j], midTiers[i]];
+    [mid[i], mid[j]] = [mid[j], mid[i]];
   }
-  const extra = midTiers.slice(0, MAX_ROUNDS - DIFF_TIERS.length);
-  const all = [...tiers, ...extra];
-  for (let i = all.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [all[i], all[j]] = [all[j], all[i]];
-  }
-  return all;
+  return [0, ...mid, 9];
 }
 
 function calcMinSafeFuel(vy, altitude, gravity, maxFuel) {
@@ -799,7 +709,7 @@ function smallPill(selected, color = "#334155") {
   };
 }
 
-export default function RocketLander({ onRoundComplete }) {
+export default function RocketLander() {
   const canvasRef = useRef(null);
   const animRef = useRef(0);
   const gameRef = useRef(null);
@@ -810,8 +720,6 @@ export default function RocketLander({ onRoundComplete }) {
   const lastTRef = useRef(0);
   const decisionRef = useRef(null);
   const flightMetricsRef = useRef({ framesBelowMin: 0, totalFrames: 0, slackSum: 0 });
-  const flightDataRef = useRef(null);
-  const [flightTick, setFlightTick] = useState(0);
 
   const [phase, setPhase] = useState("menu");
   const [roundOrder, setRoundOrder] = useState(() => genRoundOrder());
@@ -820,11 +728,10 @@ export default function RocketLander({ onRoundComplete }) {
   const [padPositions, setPadPositions] = useState([]);
   const [terrain, setTerrain] = useState([]);
   const [wealth, setWealth] = useState(START_WEALTH);
-  const [betPct, setBetPct] = useState(0);
+  const [betPct, setBetPct] = useState(20);
   const [posterior, setPosterior] = useState(() => createJointPrior());
   const [skillState, setSkillState] = useState(createSkillState);
-  const [marketBook, setMarketBook] = useState(() => createEmptyMarketBook());
-  const [marketBookLoaded, setMarketBookLoaded] = useState(false);
+  const [marketBook, setMarketBook] = useState(() => loadMarketBook());
   const [lastResult, setLastResult] = useState(null);
   const [roundHistory, setRoundHistory] = useState([]);
   const [shakeOffset, setShakeOffset] = useState({ x: 0, y: 0 });
@@ -835,21 +742,9 @@ export default function RocketLander({ onRoundComplete }) {
   const currentRiskFreeRate = roundRiskFreeRate(currentTierIdx);
   const skill = skillState.mu;
   const skillCertainty = skillClarity(skillState.sigma2);
-  const smoothedGrid = useMemo(() => buildSmoothedGrid(marketBook), [marketBook]);
   const marketObs = useMemo(() => totalLocalMarketObservations(marketBook), [marketBook]);
   const betFrac = clamp(betPct / 100, 0, 1);
   const plannedBet = Math.round(wealth * betFrac);
-
-  const sliderToLogPct = useCallback((sliderVal) => {
-    if (sliderVal <= 0) return 0;
-    const t = sliderVal / 100;
-    return Math.round(clamp((Math.pow(10, t * 2) - 1) / 99 * 100, 0, 100));
-  }, []);
-  const logPctToSlider = useCallback((pct) => {
-    if (pct <= 0) return 0;
-    return clamp(Math.log10(pct / 100 * 99 + 1) / 2 * 100, 0, 100);
-  }, []);
-  const [sliderVal, setSliderVal] = useState(() => logPctToSlider(betPct));
 
   const posteriorStats = useMemo(() => jointPosteriorStats(posterior), [posterior]);
   const gamma = posteriorStats.gammaMean;
@@ -861,14 +756,14 @@ export default function RocketLander({ onRoundComplete }) {
     () =>
       PADS.map((_, i) =>
         marketQuote({
-          marketBook: smoothedGrid,
+          marketBook,
           tierIdx: currentTierIdx,
           padIdx: i,
           skillMu: skillState.mu,
           skillSigma2: skillState.sigma2,
         })
       ),
-    [smoothedGrid, currentTierIdx, skillState.mu, skillState.sigma2]
+    [marketBook, currentTierIdx, skillState.mu, skillState.sigma2]
   );
 
   const selectedPreview = useMemo(() => {
@@ -880,24 +775,17 @@ export default function RocketLander({ onRoundComplete }) {
       betFrac,
       skillMu: skill,
       skillSigma2: skillState.sigma2,
-      marketBook: smoothedGrid,
+      marketBook,
     });
-  }, [wealth, currentTierIdx, chosenPadIdx, betFrac, skill, skillState.sigma2, smoothedGrid]);
-
-  useEffect(() => {
-    setSliderVal(Math.round(logPctToSlider(betPct)));
-  }, [betPct, logPctToSlider]);
+  }, [wealth, currentTierIdx, chosenPadIdx, betFrac, skill, skillState.sigma2, marketBook]);
 
   useEffect(() => {
     terrainRef.current = terrain;
   }, [terrain]);
 
   useEffect(() => {
-    fetchMarketBookFromDB().then((book) => {
-      setMarketBook(book);
-      setMarketBookLoaded(true);
-    });
-  }, []);
+    saveMarketBook(marketBook);
+  }, [marketBook]);
 
   useEffect(() => {
     padsRef.current = padPositions;
@@ -926,7 +814,7 @@ export default function RocketLander({ onRoundComplete }) {
     setPadPositions(pads);
     setTerrain(terr);
     setChosenPadIdx(-1);
-    setBetPct(0);
+    setBetPct(20);
     setLastResult(null);
     decisionRef.current = null;
     particlesRef.current = [];
@@ -938,11 +826,10 @@ export default function RocketLander({ onRoundComplete }) {
       y: START_Y[tierIdx],
       vx: (Math.random() - 0.5) * 0.3,
       vy: 0,
-      fuel: tier.fuel * (window.innerWidth < 640 ? 1.5 : 1),
-      maxFuel: tier.fuel * (window.innerWidth < 640 ? 1.5 : 1),
+      fuel: tier.fuel,
+      maxFuel: tier.fuel,
       gravity: tier.gravity,
       windStr: tier.wind,
-      windPhase: Math.random() * Math.PI * 2,
       wind: 0,
       rotation: 0,
       time: 0,
@@ -1011,47 +898,6 @@ export default function RocketLander({ onRoundComplete }) {
     if (gameRef.current) gameRef.current.keys[key] = state;
   }, []);
 
-  const touchOriginRef = useRef(null);
-
-  const handleTouchZoneStart = useCallback((e) => {
-    e.preventDefault();
-    const touch = e.touches[0];
-    touchOriginRef.current = { x: touch.clientX, y: touch.clientY };
-    if (gameRef.current) {
-      gameRef.current.keys.up = true;
-      gameRef.current.keys.left = false;
-      gameRef.current.keys.right = false;
-    }
-  }, []);
-
-  const handleTouchZoneMove = useCallback((e) => {
-    e.preventDefault();
-    if (!touchOriginRef.current || !gameRef.current) return;
-    const touch = e.touches[0];
-    const dx = touch.clientX - touchOriginRef.current.x;
-    const deadZone = 20;
-    if (dx < -deadZone) {
-      gameRef.current.keys.left = true;
-      gameRef.current.keys.right = false;
-    } else if (dx > deadZone) {
-      gameRef.current.keys.right = true;
-      gameRef.current.keys.left = false;
-    } else {
-      gameRef.current.keys.left = false;
-      gameRef.current.keys.right = false;
-    }
-  }, []);
-
-  const handleTouchZoneEnd = useCallback((e) => {
-    e.preventDefault();
-    touchOriginRef.current = null;
-    if (gameRef.current) {
-      gameRef.current.keys.up = false;
-      gameRef.current.keys.left = false;
-      gameRef.current.keys.right = false;
-    }
-  }, []);
-
   const launchMission = () => {
     if (chosenPadIdx < 0 || !gameRef.current) return;
 
@@ -1064,7 +910,7 @@ export default function RocketLander({ onRoundComplete }) {
       betFrac,
       skillMu: skill,
       skillSigma2: skillState.sigma2,
-      marketBook: smoothedGrid,
+      marketBook,
     });
     const actionWeight = 0.55 + 0.75 * betFrac;
 
@@ -1082,7 +928,6 @@ export default function RocketLander({ onRoundComplete }) {
       qPersonal: quote.qPersonal,
       roundRf: quote.riskFreeRate,
       promoEdge: quote.promoEdge,
-      skillSurcharge: quote.skillSurcharge,
       profitMult: quote.profitMult,
       fuelBonusCapPct: PADS[chosenPadIdx].fuelBonusCapPct,
       label: PADS[chosenPadIdx].label,
@@ -1125,9 +970,7 @@ export default function RocketLander({ onRoundComplete }) {
     const safeWealth = Math.round(cash * (1 + decision.roundRf));
     const missionWealth = Math.round(decision.betAmount * (1 + decision.profitMult));
     const fuelFrac = fuel / Math.max(1, maxFuel);
-    const fuelSkillDiscount = clamp(skillClarity(skillState.sigma2) * Math.max(0, skillState.mu - 0.5) * 1.2, 0, 0.7);
-    const effectiveFuelCap = decision.fuelBonusCapPct * (1 - fuelSkillDiscount);
-    const fuelBonus = Math.round(decision.betAmount * effectiveFuelCap * fuelFrac);
+    const fuelBonus = Math.round(decision.betAmount * decision.fuelBonusCapPct * fuelFrac);
     const wealthAfter = Math.round(safeWealth + missionWealth + fuelBonus);
     const pnl = wealthAfter - decision.wealthBefore;
 
@@ -1160,7 +1003,6 @@ export default function RocketLander({ onRoundComplete }) {
       populationQ: decision.qBook,
       roundRf: decision.roundRf,
       promoEdge: decision.promoEdge,
-      skillSurcharge: decision.skillSurcharge,
       fuelBonus,
       fuelPct: fuelFrac,
       speed,
@@ -1182,7 +1024,6 @@ export default function RocketLander({ onRoundComplete }) {
         populationQ: decision.qBook,
         roundRf: decision.roundRf,
         promoEdge: decision.promoEdge,
-      skillSurcharge: decision.skillSurcharge,
         wealthBefore: decision.wealthBefore,
         wealthAfter,
         pnl,
@@ -1194,19 +1035,8 @@ export default function RocketLander({ onRoundComplete }) {
     setLastInsight(
       `Mission filled. ${fmt$(decision.betAmount)} staked at +${(decision.profitMult * 100).toFixed(0)}% success return. Cash sleeve compounded at ${fmtPct(decision.roundRf, 1)} and fuel bonus added ${fmt$(fuelBonus)}.`
     );
-    if (onRoundComplete) {
-      onRoundComplete({
-        tierIdx: decision.tierIdx,
-        padIdx: decision.padIdx,
-        betFrac: decision.betFrac,
-        wealth: wealthAfter,
-        success: true,
-        fuelUsed: parseFloat((maxFuel - fuel).toFixed(1)),
-        score: parseFloat(pnl.toFixed(1)),
-      });
-    }
     setPhase("result");
-  }, [applyFuelPreferenceUpdate, onRoundComplete]);
+  }, [applyFuelPreferenceUpdate]);
 
   const resolveMiss = useCallback((landedPadIdx, speed, fuel, maxFuel) => {
     const decision = decisionRef.current;
@@ -1240,7 +1070,6 @@ export default function RocketLander({ onRoundComplete }) {
       populationQ: decision.qBook,
       roundRf: decision.roundRf,
       promoEdge: decision.promoEdge,
-      skillSurcharge: decision.skillSurcharge,
       fuelBonus: 0,
       fuelPct: fuelFrac,
       speed,
@@ -1261,7 +1090,6 @@ export default function RocketLander({ onRoundComplete }) {
         populationQ: decision.qBook,
         roundRf: decision.roundRf,
         promoEdge: decision.promoEdge,
-      skillSurcharge: decision.skillSurcharge,
         wealthBefore: decision.wealthBefore,
         wealthAfter,
         pnl,
@@ -1270,21 +1098,10 @@ export default function RocketLander({ onRoundComplete }) {
     ]);
 
     setLastInsight(`Soft touchdown, but not on the contracted pad. Stake lost; idle cash still earned ${fmtPct(decision.roundRf, 1)} and the local market book recorded a miss for this contract.`);
-    if (onRoundComplete) {
-      onRoundComplete({
-        tierIdx: decision.tierIdx,
-        padIdx: decision.padIdx,
-        betFrac: decision.betFrac,
-        wealth: wealthAfter,
-        success: false,
-        fuelUsed: parseFloat((maxFuel - fuel).toFixed(1)),
-        score: parseFloat(pnl.toFixed(1)),
-      });
-    }
     setPhase("result");
-  }, [onRoundComplete]);
+  }, []);
 
-  const resolveCrash = useCallback((landedPadIdx, speed, fuel, maxFuel) => {
+  const resolveCrash = useCallback((landedPadIdx, speed) => {
     const decision = decisionRef.current;
     if (!decision) return;
 
@@ -1311,7 +1128,6 @@ export default function RocketLander({ onRoundComplete }) {
       populationQ: decision.qBook,
       roundRf: decision.roundRf,
       promoEdge: decision.promoEdge,
-      skillSurcharge: decision.skillSurcharge,
       fuelBonus: 0,
       fuelPct: 0,
       speed,
@@ -1332,7 +1148,6 @@ export default function RocketLander({ onRoundComplete }) {
         populationQ: decision.qBook,
         roundRf: decision.roundRf,
         promoEdge: decision.promoEdge,
-      skillSurcharge: decision.skillSurcharge,
         wealthBefore: decision.wealthBefore,
         wealthAfter,
         pnl,
@@ -1351,19 +1166,8 @@ export default function RocketLander({ onRoundComplete }) {
     }, 36);
 
     setLastInsight(`Crash. The stake was lost; only unbet wealth rolled forward at ${fmtPct(decision.roundRf, 1)}. The market book logged a failed contract for this tier and pad.`);
-    if (onRoundComplete) {
-      onRoundComplete({
-        tierIdx: decision.tierIdx,
-        padIdx: decision.padIdx,
-        betFrac: decision.betFrac,
-        wealth: wealthAfter,
-        success: false,
-        fuelUsed: parseFloat(((maxFuel || 0) - (fuel || 0)).toFixed(1)),
-        score: parseFloat(pnl.toFixed(1)),
-      });
-    }
     setPhase("result");
-  }, [onRoundComplete]);
+  }, []);
 
   useEffect(() => {
     if (phase !== "playing" || !gameRef.current) return;
@@ -1383,9 +1187,9 @@ export default function RocketLander({ onRoundComplete }) {
       const dt = Math.min(rawDt, 33) / 16.67;
 
       g.time += dt;
-      g.wind = g.windStr * (Math.sin(g.time * 0.008) + 0.6 * Math.sin(g.time * 0.031) + 0.35 * Math.sin(g.time * 0.071 + g.windPhase));
+      g.wind = g.windStr * (Math.sin(g.time * 0.008) + 0.6 * Math.sin(g.time * 0.031));
       g.vy += g.gravity * dt;
-      g.vx += g.wind * 0.0040 * dt;
+      g.vx += g.wind * 0.0008 * dt;
 
       if (g.keys.up && g.fuel > 0) {
         g.vy -= THRUST * dt;
@@ -1499,22 +1303,93 @@ export default function RocketLander({ onRoundComplete }) {
               color: Math.random() > 0.5 ? "#ff6b35" : "#ffdd00",
             });
           }
-          resolveCrash(touchedPadIdx, speed, g.fuel, g.maxFuel);
+          resolveCrash(touchedPadIdx, speed);
         }
       }
 
       drawScene(ctx, g, padsRef.current, terr, decisionRef.current?.padIdx ?? -1, g.time, particlesRef.current, starsRef.current, false);
 
-      flightDataRef.current = {
-        altitude: Math.round(altitude / 3.5),
-        speed: parseFloat(speed.toFixed(1)),
-        speedSafe: speed <= SAFE_V,
-        speedWarn: speed > SAFE_V && speed <= HARD_V,
-        fuelPct: Math.round(fuelPct * 100),
-        fuelLow: fuelPct <= 0.12,
-        fuelWarn: fuelPct > 0.12 && fuelPct <= 0.30,
-      };
-      if (g.time % 6 < 1) setFlightTick((t) => t + 1);
+      ctx.fillStyle = "rgba(6,8,15,0.82)";
+      ctx.fillRect(8, 8, 176, 118);
+      ctx.strokeStyle = "#1e293b";
+      ctx.strokeRect(8, 8, 176, 118);
+      ctx.font = "11px monospace";
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("ALT", 16, 28);
+      ctx.fillStyle = "#e2e8f0";
+      ctx.textAlign = "right";
+      ctx.fillText(`${Math.round(altitude / 3.5)}m`, 112, 28);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("VEL", 16, 46);
+      ctx.fillStyle = speed <= SAFE_V ? "#4ade80" : speed <= HARD_V ? "#fbbf24" : "#ef4444";
+      ctx.textAlign = "right";
+      ctx.fillText(speed.toFixed(1), 112, 46);
+      ctx.fillStyle = "#64748b";
+      ctx.fillText("m/s", 136, 46);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("FUEL", 16, 64);
+      ctx.fillStyle = "#64748b";
+      ctx.fillText(`${Math.round(fuelPct * 100)}%`, 112, 64);
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("BET", 16, 82);
+      ctx.fillStyle = "#e2e8f0";
+      ctx.textAlign = "right";
+      ctx.fillText(fmt$(decisionRef.current?.betAmount || 0), 160, 82);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("γ", 16, 100);
+      ctx.fillStyle = "#0ea5e9";
+      ctx.textAlign = "right";
+      ctx.fillText(gamma.toFixed(1), 74, 100);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("EDGE", 92, 100);
+      ctx.fillStyle = edge >= 0 ? "#f97316" : "#a78bfa";
+      ctx.textAlign = "right";
+      ctx.fillText(`${edge >= 0 ? "+" : ""}${edge.toFixed(2)}`, 160, 100);
+
+      const barX = 62;
+      const barY = 70;
+      const barW = 100;
+      const barH = 10;
+      ctx.fillStyle = "#1e293b";
+      ctx.fillRect(barX, barY, barW, barH);
+      ctx.fillStyle = fuelPct > 0.30 ? "#4ade80" : fuelPct > 0.12 ? "#fbbf24" : "#ef4444";
+      ctx.fillRect(barX, barY, barW * fuelPct, barH);
+      const minFuelPct = Math.min(1, minFuel / Math.max(1, g.maxFuel));
+      const markerX = barX + barW * minFuelPct;
+      if (minFuelPct > 0.01 && minFuelPct < 0.98) {
+        ctx.strokeStyle = fuelPct < minFuelPct ? "#ef4444" : "#fbbf2488";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(markerX, barY - 2);
+        ctx.lineTo(markerX, barY + barH + 2);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "rgba(6,8,15,0.82)";
+      ctx.fillRect(W - 206, 8, 198, 86);
+      ctx.strokeStyle = "#1e293b";
+      ctx.strokeRect(W - 206, 8, 198, 86);
+      ctx.fillStyle = "#64748b";
+      ctx.font = "10px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(`ROUND ${round}/${MAX_ROUNDS}`, W - 196, 24);
+      ctx.fillText(`${currentTier.label} · rf ${fmtPct(currentRiskFreeRate, 1)}`, W - 196, 40);
+      if (decisionRef.current) {
+        ctx.fillStyle = PADS[decisionRef.current.padIdx].color;
+        ctx.font = "bold 11px monospace";
+        ctx.fillText(`${decisionRef.current.label} target`, W - 196, 58);
+        ctx.fillStyle = "#e2e8f0";
+        ctx.textAlign = "right";
+        ctx.fillText(`+${(decisionRef.current.profitMult * 100).toFixed(0)}%`, W - 18, 58);
+        ctx.textAlign = "left";
+        ctx.fillStyle = "#94a3b8";
+        ctx.fillText(`Wealth ${fmt$(wealth)}`, W - 196, 76);
+      }
 
       animRef.current = requestAnimationFrame(loop);
     };
@@ -1538,114 +1413,121 @@ export default function RocketLander({ onRoundComplete }) {
   const wealthPath = [START_WEALTH, ...roundHistory.map((r) => r.wealthAfter)];
   const wealthPeak = Math.max(...wealthPath, START_WEALTH);
 
-  const isMobile = useIsMobile();
-
   const overlayBase = {
-    flex: 1,
+    position: "absolute",
+    inset: 0,
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
     justifyContent: "flex-start",
-    background: "transparent",
-    padding: isMobile ? "10px 8px 14px" : "14px 14px 20px",
+    background: "rgba(6,8,15,0.85)",
+    backdropFilter: "blur(2px)",
+    padding: "14px 14px 20px",
     color: "#e2e8f0",
     textAlign: "center",
     overflowY: "auto",
     overflowX: "hidden",
-    width: "100%",
   };
 
   const summaryRow = (label, value, valueColor = "#e2e8f0") => (
-    <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", width: "100%", fontSize: isMobile ? "11px" : "13px" }}>
+    <div style={{ display: "flex", justifyContent: "space-between", gap: "20px", width: "100%", fontSize: "13px" }}>
       <span style={{ color: "#94a3b8" }}>{label}</span>
-      <span style={{ color: valueColor, textAlign: "right" }}>{value}</span>
+      <span style={{ color: valueColor }}>{value}</span>
     </div>
   );
 
   return (
     <div
       style={{
-        height: "100vh",
-        width: "100%",
+        minHeight: "100vh",
         background: "radial-gradient(circle at top, #10162d 0%, #070b14 50%, #05070d 100%)",
         color: "#e2e8f0",
         fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
-        display: "flex",
-        flexDirection: "column",
+        padding: "20px",
         boxSizing: "border-box",
-        overflow: "hidden",
       }}
     >
       <div
         style={{
-          width: "100%",
-          maxWidth: `${W}px`,
+          width: `${W}px`,
+          maxWidth: "100%",
           margin: "0 auto",
           position: "relative",
-          borderRadius: isMobile ? "0" : "18px",
+          borderRadius: "18px",
           overflow: "hidden",
-          border: isMobile ? "none" : "1px solid #1e293b",
-          boxShadow: isMobile ? "none" : "0 24px 80px rgba(0,0,0,0.45)",
+          border: "1px solid #1e293b",
+          boxShadow: "0 24px 80px rgba(0,0,0,0.45)",
           background: "#06080f",
           transform: `translate(${shakeOffset.x}px, ${shakeOffset.y}px)`,
-          flex: phase === "playing" ? "none" : "1",
-          display: "flex",
-          flexDirection: "column",
-          marginTop: isMobile ? "0" : "8px",
         }}
       >
-        <canvas ref={canvasRef} width={W} height={H} style={{ width: "100%", display: phase === "playing" ? "block" : "none" }} />
+        <canvas ref={canvasRef} width={W} height={H} style={{ width: "100%", display: "block" }} />
 
-        
+        {phase === "playing" && (
+          <div style={{ position: "absolute", top: 8, left: 8, right: 8, display: "flex", justifyContent: "space-between", gap: "6px", pointerEvents: "none", zIndex: 20 }}>
+            <div style={{ pointerEvents: "auto", background: "rgba(6,8,15,0.8)", border: "1px solid #1e293b", borderRadius: "10px", padding: "8px 12px", minWidth: "180px" }}>
+              <div style={{ fontSize: "10px", color: "#64748b", letterSpacing: "1px" }}>TOTAL WEALTH</div>
+              <div style={{ fontSize: "20px", fontWeight: 700, color: wealth >= START_WEALTH ? "#4ade80" : "#fbbf24" }}>{fmt$(wealth)}</div>
+              <div style={{ fontSize: "11px", color: wealthDelta >= 0 ? "#4ade80" : "#f87171" }}>{wealthDelta >= 0 ? "+" : ""}{fmt$(wealthDelta)} vs start</div>
+            </div>
+            <div style={{ pointerEvents: "auto", background: "rgba(6,8,15,0.8)", border: "1px solid #1e293b", borderRadius: "10px", padding: "8px 12px", minWidth: "220px" }}>
+              <div style={{ fontSize: "10px", color: "#64748b", letterSpacing: "1px" }}>POSTERIOR NOW</div>
+              <div style={{ display: "flex", gap: "18px", marginTop: "2px", fontSize: "13px" }}>
+                <div>γ <span style={{ color: "#0ea5e9", fontWeight: 700 }}>{gamma.toFixed(1)}</span></div>
+                <div>edge <span style={{ color: edge >= 0 ? "#f97316" : "#a78bfa", fontWeight: 700 }}>{edge >= 0 ? "+" : ""}{edge.toFixed(2)}</span></div>
+                <div>skill <span style={{ color: "#22c55e", fontWeight: 700 }}>{skill.toFixed(2)}</span></div>
+              </div>
+              <div style={{ fontSize: "10px", color: "#64748b", marginTop: "2px" }}>Quotes blend local play history with your observed skill. Promo edge is larger on safer missions and compresses as skill becomes clearer.</div>
+            </div>
+          </div>
+        )}
 
         {phase === "menu" && (
           <div style={overlayBase}>
-            <div style={{ fontSize: isMobile ? "10px" : "11px", letterSpacing: "3px", color: "#38bdf8", marginBottom: "8px" }}>ROCKET LANDER · WEALTH EDITION</div>
-            <h1 style={{ fontSize: isMobile ? "20px" : "28px", margin: "0 0 8px" }}>Adaptive market, explicit stakes.</h1>
-            <p style={{ maxWidth: "560px", color: "#94a3b8", lineHeight: 1.6, fontSize: isMobile ? "12px" : "14px", margin: "0 0 14px" }}>
+            <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#38bdf8", marginBottom: "8px" }}>ROCKET LANDER · WEALTH EDITION</div>
+            <h1 style={{ fontSize: "28px", margin: "0 0 8px" }}>Adaptive market, explicit stakes.</h1>
+            <p style={{ maxWidth: "560px", color: "#94a3b8", lineHeight: 1.6, fontSize: "14px", margin: "0 0 18px" }}>
               You begin with <strong>{fmt$(START_WEALTH)}</strong>. Each round you choose a mission, size the stake, then actually fly it.
               Unbet cash earns a round-specific risk-free return that falls as conditions get harder. Mission quotes are <strong>risk-neutral first</strong>, then receive a small promo edge that is larger on safer missions and shrinks as your skill becomes clearer.
             </p>
-            <div style={{ maxWidth: "560px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: isMobile ? "10px 12px" : "14px 16px", marginBottom: "16px", textAlign: "left", fontSize: isMobile ? "11px" : "13px", lineHeight: 1.6, color: "#cbd5e1" }}>
+            <div style={{ maxWidth: "560px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "14px 16px", marginBottom: "20px", textAlign: "left", fontSize: "13px", lineHeight: 1.6, color: "#cbd5e1" }}>
               <div><span style={{ color: "#4ade80" }}>① Risk-neutral baseline</span> means success payouts include the round&apos;s cash return before any promo edge is added.</div>
               <div><span style={{ color: "#fbbf24" }}>② Adaptive quotes</span> blend local play history with your inferred skill, then give safer missions a slightly larger subsidy.</div>
               <div><span style={{ color: "#f87171" }}>③ Fuel left</span> still matters: efficient landings lift realised P&amp;L, while excess safety burn is a weak caution signal.</div>
             </div>
-            <div style={{ display: "flex", gap: "14px", marginBottom: "14px", fontSize: "12px", color: "#64748b", flexWrap: "wrap", justifyContent: "center" }}>
+            <div style={{ display: "flex", gap: "18px", marginBottom: "18px", fontSize: "12px", color: "#64748b" }}>
               <span>↑ / W thrust</span>
               <span>← → / A D steer</span>
-              <span>{MAX_ROUNDS} rounds</span>
+              <span>10 rounds</span>
             </div>
-            <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
-              <button onClick={startGame} style={btnStyle("#0ea5e9")} data-testid="button-start">START SESSION</button>
-              <button onClick={resetLocalBook} style={btnStyle("#334155")} data-testid="button-reset-book">RESET LOCAL BOOK</button>
+            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+              <button onClick={startGame} style={btnStyle("#0ea5e9")}>START SESSION</button>
+              <button onClick={resetLocalBook} style={btnStyle("#334155")}>RESET LOCAL BOOK</button>
             </div>
-            <div style={{ marginTop: "10px", fontSize: "11px", color: "#64748b" }}>Market observations: {marketObs}</div>
+            <div style={{ marginTop: "10px", fontSize: "11px", color: "#64748b" }}>Local market observations stored in this browser: {marketObs}</div>
           </div>
         )}
 
         {phase === "planning" && (
-          <div style={{ ...overlayBase, paddingTop: "10px" }}>
-            <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#64748b", marginBottom: "2px" }}>ROUND {round} OF {MAX_ROUNDS}</div>
-            <h2 style={{ margin: "0 0 2px", fontSize: isMobile ? "16px" : "20px" }}>Allocate capital</h2>
-            <p style={{ color: "#94a3b8", fontSize: isMobile ? "11px" : "13px", margin: "0 0 10px" }}>
-              {currentTier.label} · rf {fmtPct(currentRiskFreeRate, 1)} · book {marketObs} obs
+          <div style={{ ...overlayBase, paddingTop: "10px", background: "rgba(6,8,15,0.82)" }}>
+            <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#64748b", marginBottom: "4px" }}>ROUND {round} OF {MAX_ROUNDS}</div>
+            <h2 style={{ margin: "0 0 2px", fontSize: "20px" }}>Allocate capital for this mission</h2>
+            <p style={{ color: "#94a3b8", fontSize: "13px", margin: "0 0 14px" }}>
+              {currentTier.label} · Cash not staked earns {fmtPct(currentRiskFreeRate, 1)} this round · local market book {marketObs} obs
             </p>
-            {lastInsight && <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "8px", fontStyle: "italic" }}>{lastInsight}</div>}
+            {lastInsight && <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "10px", fontStyle: "italic" }}>{lastInsight}</div>}
 
-            <div style={{ display: "flex", gap: isMobile ? "6px" : "10px", marginBottom: "10px", flexWrap: "wrap", justifyContent: "center", width: "100%", maxWidth: "680px" }}>
+            <div style={{ display: "flex", gap: "10px", marginBottom: "14px", flexWrap: "wrap", justifyContent: "center", maxWidth: "680px" }}>
               {PADS.map((pad, i) => {
                 const quote = currentQuotes[i];
                 const selected = chosenPadIdx === i;
                 return (
                   <button
                     key={pad.label}
-                    data-testid={`pad-${pad.label.toLowerCase()}`}
                     onClick={() => setChosenPadIdx(i)}
                     style={{
-                      flex: isMobile ? "1 1 0" : "0 0 190px",
-                      minWidth: isMobile ? "0" : "190px",
-                      padding: isMobile ? "8px 6px 6px" : "10px 10px 8px",
+                      width: "190px",
+                      padding: "10px 10px 8px",
                       borderRadius: "10px",
                       border: `2px solid ${selected ? pad.color : "#1e293b"}`,
                       background: selected ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.02)",
@@ -1654,39 +1536,39 @@ export default function RocketLander({ onRoundComplete }) {
                       textAlign: "left",
                     }}
                   >
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: isMobile ? "4px" : "8px" }}>
-                      <div style={{ fontSize: isMobile ? "13px" : "15px", fontWeight: 700, color: pad.color }}>{pad.label}</div>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                      <div style={{ fontSize: "15px", fontWeight: 700, color: pad.color }}>{pad.label}</div>
+                      <div style={{ fontSize: "10px", color: "#64748b" }}>adaptive quote</div>
                     </div>
-                    {!isMobile && <div style={{ fontSize: "12px", color: "#cbd5e1", marginBottom: "6px", minHeight: "24px" }}>{pad.desc}</div>}
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 8px", fontSize: isMobile ? "11px" : "12px", marginBottom: isMobile ? "4px" : "8px" }}>
+                    <div style={{ fontSize: "12px", color: "#cbd5e1", marginBottom: "6px", minHeight: "24px" }}>{pad.desc}</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 12px", fontSize: "12px", marginBottom: "8px" }}>
                       <div>
-                        <div style={{ color: "#64748b", fontSize: "10px" }}>HIT</div>
+                        <div style={{ color: "#64748b", fontSize: "10px" }}>HIT-RATE</div>
                         <div style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmtPct(quote.qQuote)}</div>
                       </div>
                       <div>
-                        <div style={{ color: "#64748b", fontSize: "10px" }}>RETURN</div>
+                        <div style={{ color: "#64748b", fontSize: "10px" }}>SUCCESS RETURN</div>
                         <div style={{ color: pad.color, fontWeight: 700 }}>+{(quote.profitMult * 100).toFixed(0)}%</div>
                       </div>
                     </div>
-                    {!isMobile && (
-                      <div style={{ fontSize: "11px", color: "#94a3b8" }}>
-                        Pop {fmtPct(quote.qBook)} · promo +{fmtPct(quote.promoEdge, 2)}
-                      </div>
-                    )}
+                    <div style={{ fontSize: "11px", color: "#94a3b8" }}>
+                      Population {fmtPct(quote.qBook)} · rf {fmtPct(quote.riskFreeRate, 1)} · promo +{fmtPct(quote.promoEdge, 2)}
+                    </div>
+                    <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "4px" }}>Fuel bonus: up to +{(pad.fuelBonusCapPct * 100).toFixed(0)}% of stake on a fuel-efficient landing.</div>
                   </button>
                 );
               })}
             </div>
 
-            <div style={{ width: "100%", maxWidth: "620px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: isMobile ? "10px 12px" : "14px 16px", marginBottom: "10px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+            <div style={{ width: "100%", maxWidth: "620px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: "14px 16px", marginBottom: "14px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
                 <div style={{ textAlign: "left" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", letterSpacing: "1px" }}>STAKE</div>
-                  <div style={{ fontSize: isMobile ? "16px" : "20px", fontWeight: 700, color: plannedBet > 0 ? "#fbbf24" : "#94a3b8" }}>{fmt$(plannedBet)}</div>
+                  <div style={{ fontSize: "11px", color: "#64748b", letterSpacing: "1px" }}>STAKE</div>
+                  <div style={{ fontSize: "20px", fontWeight: 700, color: plannedBet > 0 ? "#fbbf24" : "#94a3b8" }}>{fmt$(plannedBet)}</div>
                 </div>
                 <div style={{ textAlign: "right" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", letterSpacing: "1px" }}>FRACTION</div>
-                  <div style={{ fontSize: isMobile ? "16px" : "20px", fontWeight: 700 }}>{betPct}%</div>
+                  <div style={{ fontSize: "11px", color: "#64748b", letterSpacing: "1px" }}>FRACTION OF WEALTH</div>
+                  <div style={{ fontSize: "20px", fontWeight: 700 }}>{betPct}%</div>
                 </div>
               </div>
               <input
@@ -1694,294 +1576,82 @@ export default function RocketLander({ onRoundComplete }) {
                 min={0}
                 max={100}
                 step={1}
-                value={sliderVal}
-                onChange={(e) => {
-                  const sv = Number(e.target.value);
-                  setSliderVal(sv);
-                  setBetPct(sliderToLogPct(sv));
-                }}
+                value={betPct}
+                onChange={(e) => setBetPct(Number(e.target.value))}
                 style={{ width: "100%", marginBottom: "10px" }}
               />
               <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "center" }}>
                 {[0, 5, 10, 20, 35, 50, 75, 100].map((p) => (
-                  <button key={p} onClick={() => { setBetPct(p); setSliderVal(logPctToSlider(p)); }} style={smallPill(betPct === p, "#334155")}>{p}%</button>
+                  <button key={p} onClick={() => setBetPct(p)} style={smallPill(betPct === p, "#334155")}>{p}%</button>
                 ))}
               </div>
             </div>
 
             {selectedPreview && chosenPadIdx >= 0 && (
-              <div style={{ width: "100%", maxWidth: "620px", display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: isMobile ? "8px" : "12px", marginBottom: "10px" }}>
-                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: isMobile ? "8px 10px" : "12px", textAlign: "left" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", letterSpacing: "1px", marginBottom: "6px" }}>OUTCOME PREVIEW</div>
+              <div style={{ width: "100%", maxWidth: "620px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "14px" }}>
+                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "12px", textAlign: "left" }}>
+                  <div style={{ fontSize: "11px", color: "#64748b", letterSpacing: "1px", marginBottom: "8px" }}>OUTCOME PREVIEW</div>
                   {summaryRow("If mission fails", fmt$(selectedPreview.failWealth), plannedBet > 0 ? "#f87171" : "#e2e8f0")}
                   {summaryRow("If mission succeeds", fmt$(selectedPreview.successWealth), "#4ade80")}
                   {summaryRow("Expected success with fuel", fmt$(selectedPreview.expectedSuccessWithFuel), "#22c55e")}
                   {summaryRow("Fuel bonus expectation", `~${fmt$(plannedBet * selectedPreview.expectedBonusPct)}`, "#22c55e")}
-                  {plannedBet > 0 && (() => {
-                    const ev = selectedPreview.qQuote * selectedPreview.successWealth + (1 - selectedPreview.qQuote) * selectedPreview.failWealth;
-                    return summaryRow("EV of this allocation", fmt$(Math.round(ev)), ev >= wealth ? "#4ade80" : "#fbbf24");
-                  })()}
                 </div>
-                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: isMobile ? "8px 10px" : "12px", textAlign: "left" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", letterSpacing: "1px", marginBottom: "6px" }}>QUOTE QUALITY</div>
+                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "12px", textAlign: "left" }}>
+                  <div style={{ fontSize: "11px", color: "#64748b", letterSpacing: "1px", marginBottom: "8px" }}>QUOTE QUALITY</div>
                   {summaryRow("Population hit-rate", fmtPct(selectedPreview.qBook), "#94a3b8")}
                   {summaryRow("Your quoted hit-rate", fmtPct(selectedPreview.qQuote), PADS[chosenPadIdx].color)}
                   {summaryRow("Return on success", `+${(selectedPreview.profitMult * 100).toFixed(0)}% of stake`, PADS[chosenPadIdx].color)}
                   {summaryRow("Cash sleeve rf", fmtPct(selectedPreview.riskFreeRate, 1), "#4ade80")}
-                  {selectedPreview.skillSurcharge > 0.001
-                    ? summaryRow(
-                        "Skill surcharge",
-                        `-${(selectedPreview.skillSurcharge * 100).toFixed(2)}%`,
-                        "#f97316"
-                      )
-                    : summaryRow("Promo over cash", `+${(selectedPreview.averagePilotEV * 100).toFixed(2)}%`, "#4ade80")
-                  }
-                  {selectedPreview.promoEdge < 0 && summaryRow(
-                    "Net market adj",
-                    `${(selectedPreview.promoEdge * 100).toFixed(2)}%`,
-                    "#ef4444"
-                  )}
-                  {selectedPreview.skillSurcharge > 0.001 ? (
-                    <div style={{ color: "#f97316", fontSize: "11px", marginTop: "8px", lineHeight: 1.5 }}>
-                      Market has priced in your skill — betting big here is overconfidence territory.
-                    </div>
-                  ) : (
-                    <div style={{ color: "#64748b", fontSize: "11px", marginTop: "8px", lineHeight: 1.5 }}>
-                      Safer missions keep a slightly larger subsidy. As the game becomes more certain about your skill, the quote leans more toward your own demonstrated hit-rate and the subsidy compresses.
-                    </div>
-                  )}
+                  {summaryRow("Promo over cash", `+${(selectedPreview.averagePilotEV * 100).toFixed(2)}%`, "#4ade80")}
+                  <div style={{ color: "#64748b", fontSize: "11px", marginTop: "8px", lineHeight: 1.5 }}>
+                    Safer missions keep a slightly larger subsidy. As the game becomes more certain about your skill, the quote leans more toward your own demonstrated hit-rate and the subsidy compresses.
+                  </div>
                 </div>
               </div>
             )}
 
-            {!isMobile && (
-              <div style={{ width: "100%", maxWidth: "620px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "10px" }}>
-                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "8px", textAlign: "left" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "4px" }}>γ {posteriorStats.gammaLo95.toFixed(1)}–{posteriorStats.gammaHi95.toFixed(1)}</div>
-                  <DistributionStrip values={posteriorStats.gammaMarginal} color="#0ea5e9" />
-                </div>
-                <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "8px", textAlign: "left" }}>
-                  <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "4px" }}>Edge {posteriorStats.edgeLo95.toFixed(2)}–{posteriorStats.edgeHi95.toFixed(2)}</div>
-                  <DistributionStrip values={posteriorStats.edgeMarginal} color={edge >= 0 ? "#f97316" : "#a78bfa"} />
-                </div>
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
-              <button data-testid="button-launch" onClick={launchMission} disabled={chosenPadIdx < 0} style={{ ...btnStyle(chosenPadIdx >= 0 ? PADS[chosenPadIdx].color : "#334155"), opacity: chosenPadIdx >= 0 ? 1 : 0.55, cursor: chosenPadIdx >= 0 ? "pointer" : "not-allowed" }}>
-                LAUNCH
-              </button>
-              <div style={{ fontSize: isMobile ? "10px" : "12px", color: "#94a3b8" }}>
-                <span style={{ color: "#0ea5e9", fontWeight: 700 }}>{gammaProfile.title}</span> · <span style={{ color: edge >= 0 ? "#f97316" : "#a78bfa", fontWeight: 700 }}>{edgeProfile.title}</span> · {(skillCertainty * 100).toFixed(0)}%
-              </div>
-            </div>
-          </div>
-        )}
-
-        
-
-        {phase === "result" && lastResult && (
-          <div style={overlayBase}>
-            <div style={{ fontSize: "10px", letterSpacing: "3px", color: lastResult.kind === "success" ? "#4ade80" : lastResult.kind === "miss" ? "#fbbf24" : "#ef4444", marginBottom: "4px" }}>
-              {lastResult.kind === "success" ? "MISSION FILLED" : lastResult.kind === "miss" ? "OFF-CONTRACT LANDING" : "CRASH"}
-            </div>
-            <h2 style={{ fontSize: isMobile ? "20px" : "24px", margin: "0 0 4px", color: lastResult.pnl >= 0 ? "#4ade80" : "#fbbf24" }}>{fmtSigned$(lastResult.pnl)}</h2>
-            <div style={{ fontSize: isMobile ? "12px" : "14px", color: "#94a3b8", marginBottom: "12px" }}>Wealth now <span style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmt$(lastResult.wealthAfter)}</span></div>
-
-            <div style={{ width: "100%", maxWidth: "460px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: isMobile ? "10px 12px" : "14px 16px", marginBottom: "12px" }}>
-              {summaryRow("Target", lastResult.targetLabel, PADS.find((p) => p.label === lastResult.targetLabel)?.color || "#e2e8f0")}
-              {summaryRow("Touchdown", lastResult.landedLabel)}
-              {summaryRow("Stake", fmt$(lastResult.betAmount), "#fbbf24")}
-              {summaryRow("Return", `+${(lastResult.profitMult * 100).toFixed(0)}%`)}
-              {summaryRow("Hit-rate (pop/you)", `${fmtPct(lastResult.populationQ)} / ${fmtPct(lastResult.marketQ)}`)}
-              {summaryRow("Speed", `${lastResult.speed.toFixed(2)} m/s`, lastResult.speed <= SAFE_V ? "#4ade80" : lastResult.speed <= HARD_V ? "#fbbf24" : "#ef4444")}
-              {lastResult.kind === "success" && summaryRow("Fuel bonus", fmt$(lastResult.fuelBonus), "#22c55e")}
-            </div>
-
-            {lastInsight && <div style={{ maxWidth: "460px", fontSize: isMobile ? "11px" : "13px", color: "#94a3b8", lineHeight: 1.5, marginBottom: "12px" }}>{lastInsight}</div>}
-
-            <button data-testid="button-next" onClick={nextStep} style={btnStyle(lastResult.kind === "success" ? "#22c55e" : "#0ea5e9")}>{round >= MAX_ROUNDS || wealth < BANKRUPT_FLOOR ? "SEE PROFILE" : "NEXT ROUND"}</button>
-          </div>
-        )}
-
-        {phase === "profile" && (
-          <div style={{ ...overlayBase, paddingTop: "8px" }}>
-            <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#38bdf8", marginBottom: "4px" }}>SESSION COMPLETE</div>
-            <h2 style={{ fontSize: isMobile ? "20px" : "24px", margin: "0 0 4px" }}>{fmt$(wealth)}</h2>
-            <div style={{ color: wealth >= START_WEALTH ? "#4ade80" : "#f87171", fontSize: isMobile ? "12px" : "14px", marginBottom: "12px" }}>{wealth >= START_WEALTH ? "+" : ""}{fmt$(wealth - START_WEALTH)} vs start</div>
-
-            <div style={{ width: "100%", maxWidth: "650px", display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: "8px", marginBottom: "10px" }}>
-              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: isMobile ? "10px" : "14px", textAlign: "left" }}>
-                <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "4px" }}>RISK AVERSION</div>
-                <div style={{ display: "flex", alignItems: "baseline", gap: "8px", marginBottom: "4px" }}>
-                  <span style={{ fontSize: isMobile ? "22px" : "28px", fontWeight: 700, color: "#0ea5e9" }}>γ {gamma.toFixed(2)}</span>
-                  <span style={{ fontSize: "12px", color: "#e2e8f0", fontWeight: 600 }}>{gammaProfile.title}</span>
-                </div>
-                {!isMobile && <div style={{ fontSize: "11px", color: "#94a3b8", lineHeight: 1.4, marginBottom: "6px" }}>{gammaProfile.desc}</div>}
-                <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "4px" }}>CI {posteriorStats.gammaLo95.toFixed(1)}–{posteriorStats.gammaHi95.toFixed(1)}</div>
+            <div style={{ width: "100%", maxWidth: "620px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "16px" }}>
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "10px", textAlign: "left" }}>
+                <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "6px" }}>γ posterior · {posteriorStats.gammaLo95.toFixed(1)} to {posteriorStats.gammaHi95.toFixed(1)}</div>
                 <DistributionStrip values={posteriorStats.gammaMarginal} color="#0ea5e9" />
               </div>
-
-              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: isMobile ? "10px" : "14px", textAlign: "left" }}>
-                <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "4px" }}>CONFIDENCE</div>
-                <div style={{ display: "flex", alignItems: "baseline", gap: "8px", marginBottom: "4px" }}>
-                  <span style={{ fontSize: isMobile ? "22px" : "28px", fontWeight: 700, color: edge >= 0 ? "#f97316" : "#a78bfa" }}>{edge >= 0 ? "+" : ""}{edge.toFixed(2)}</span>
-                  <span style={{ fontSize: "12px", color: "#e2e8f0", fontWeight: 600 }}>{edgeProfile.title}</span>
-                </div>
-                {!isMobile && <div style={{ fontSize: "11px", color: "#94a3b8", lineHeight: 1.4, marginBottom: "6px" }}>{edgeProfile.desc}</div>}
-                <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "4px" }}>CI {posteriorStats.edgeLo95.toFixed(2)}–{posteriorStats.edgeHi95.toFixed(2)}</div>
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "10px", textAlign: "left" }}>
+                <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "6px" }}>Edge posterior · {posteriorStats.edgeLo95.toFixed(2)} to {posteriorStats.edgeHi95.toFixed(2)}</div>
                 <DistributionStrip values={posteriorStats.edgeMarginal} color={edge >= 0 ? "#f97316" : "#a78bfa"} />
               </div>
             </div>
 
-            {edge > 0.12 && gamma < 2.0 && (
-              <div data-testid="overconfidence-flag" style={{ width: "100%", maxWidth: "650px", background: "rgba(249,115,22,0.08)", border: "1px solid #f97316", borderRadius: "12px", padding: isMobile ? "10px 12px" : "14px 16px", marginBottom: "10px", textAlign: "left" }}>
-                <div style={{ fontSize: "11px", fontWeight: 600, color: "#f97316", marginBottom: "4px" }}>OVERCONFIDENCE FLAG</div>
-                <div style={{ fontSize: "11px", color: "#e2e8f0", lineHeight: 1.5 }}>You sized bets as if your hit-rate was materially better than the market estimate — overconfidence risk.</div>
+            <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
+              <button onClick={launchMission} disabled={chosenPadIdx < 0} style={{ ...btnStyle(chosenPadIdx >= 0 ? PADS[chosenPadIdx].color : "#334155"), opacity: chosenPadIdx >= 0 ? 1 : 0.55, cursor: chosenPadIdx >= 0 ? "pointer" : "not-allowed" }}>
+                LAUNCH MISSION
+              </button>
+              <div style={{ fontSize: "12px", color: "#94a3b8" }}>
+                Current read: <span style={{ color: "#0ea5e9", fontWeight: 700 }}>{gammaProfile.title}</span> · <span style={{ color: edge >= 0 ? "#f97316" : "#a78bfa", fontWeight: 700 }}>{edgeProfile.title}</span> · skill clarity {(skillCertainty * 100).toFixed(0)}%
               </div>
-            )}
-            {edge < -0.12 && (
-              <div data-testid="underconfidence-flag" style={{ width: "100%", maxWidth: "650px", background: "rgba(167,139,250,0.08)", border: "1px solid #a78bfa", borderRadius: "12px", padding: isMobile ? "10px 12px" : "14px 16px", marginBottom: "10px", textAlign: "left" }}>
-                <div style={{ fontSize: "11px", fontWeight: 600, color: "#a78bfa", marginBottom: "4px" }}>UNDERCONFIDENCE NOTE</div>
-                <div style={{ fontSize: "11px", color: "#e2e8f0", lineHeight: 1.5 }}>You consistently sized below what your demonstrated skill would justify — leaving EV on the table.</div>
-              </div>
-            )}
-
-            <div style={{ width: "100%", maxWidth: "650px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px", marginBottom: "10px" }}>
-              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: isMobile ? "8px" : "12px" }}>
-                <div style={{ fontSize: "10px", color: "#64748b" }}>Skill</div>
-                <div style={{ fontSize: isMobile ? "18px" : "24px", fontWeight: 700, color: "#22c55e" }}>{skill.toFixed(2)}</div>
-              </div>
-              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: isMobile ? "8px" : "12px" }}>
-                <div style={{ fontSize: "10px", color: "#64748b" }}>Peak</div>
-                <div style={{ fontSize: isMobile ? "18px" : "24px", fontWeight: 700, color: "#e2e8f0" }}>{fmt$(wealthPeak)}</div>
-              </div>
-              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: isMobile ? "8px" : "12px" }}>
-                <div style={{ fontSize: "10px", color: "#64748b" }}>Obs</div>
-                <div style={{ fontSize: isMobile ? "18px" : "24px", fontWeight: 700, color: "#e2e8f0" }}>{marketObs}</div>
-              </div>
-            </div>
-
-            <div style={{ width: "100%", maxWidth: "650px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: isMobile ? "10px" : "14px", marginBottom: "12px" }}>
-              <div style={{ fontSize: "10px", color: "#64748b", marginBottom: "6px", textAlign: "left" }}>ROUND LOG</div>
-              <div style={{ maxHeight: isMobile ? "140px" : "190px", overflowY: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: isMobile ? "10px" : "12px" }}>
-                  <thead>
-                    <tr style={{ color: "#64748b", textAlign: "left" }}>
-                      <th style={{ padding: "4px 3px" }}>R</th>
-                      <th style={{ padding: "4px 3px" }}>Mission</th>
-                      <th style={{ padding: "4px 3px" }}>Stake</th>
-                      <th style={{ padding: "4px 3px" }}>P&amp;L</th>
-                      <th style={{ padding: "4px 3px" }}>Wealth</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {roundHistory.map((r) => (
-                      <tr key={r.round} style={{ borderTop: "1px solid #1e293b" }}>
-                        <td style={{ padding: "4px 3px", color: "#94a3b8" }}>{r.round}</td>
-                        <td style={{ padding: "4px 3px", color: r.outcome === "success" ? "#4ade80" : r.outcome === "miss" ? "#fbbf24" : "#f87171" }}>{r.target}</td>
-                        <td style={{ padding: "4px 3px", color: "#fbbf24" }}>{fmt$(r.betAmount)}</td>
-                        <td style={{ padding: "4px 3px", color: r.pnl >= 0 ? "#4ade80" : "#f87171" }}>{fmtSigned$(r.pnl)}</td>
-                        <td style={{ padding: "4px 3px" }}>{fmt$(r.wealthAfter)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
-              <button onClick={startGame} style={btnStyle("#0ea5e9")} data-testid="button-run-again">RUN AGAIN</button>
-              <button onClick={resetLocalBook} style={btnStyle("#334155")}>RESET BOOK</button>
             </div>
           </div>
         )}
-      </div>
 
-      {phase === "playing" && (
-        <div style={{ width: "100%", maxWidth: `${W}px`, margin: "0 auto" }}>
-          {flightDataRef.current && (
-            <div
-              data-testid="flight-info-strip"
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                padding: isMobile ? "4px 8px" : "6px 16px",
-                fontFamily: "monospace",
-                fontSize: isMobile ? "10px" : "11px",
-                color: "#94a3b8",
-                gap: "6px",
-                flexWrap: "wrap",
-              }}
-            >
-              <div style={{ display: "flex", gap: isMobile ? "8px" : "14px", alignItems: "center" }}>
-                <span>ALT <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{flightDataRef.current.altitude}m</span></span>
-                <span>VEL <span style={{ color: flightDataRef.current.speedSafe ? "#4ade80" : flightDataRef.current.speedWarn ? "#fbbf24" : "#ef4444", fontWeight: 600 }}>{flightDataRef.current.speed}</span></span>
-                <span>FUEL <span style={{ color: flightDataRef.current.fuelLow ? "#ef4444" : flightDataRef.current.fuelWarn ? "#fbbf24" : "#4ade80", fontWeight: 600 }}>{flightDataRef.current.fuelPct}%</span></span>
-              </div>
-              <div style={{ display: "flex", gap: isMobile ? "8px" : "14px", alignItems: "center" }}>
-                <span>R{round}/{MAX_ROUNDS}</span>
-                {decisionRef.current && (
-                  <>
-                    <span style={{ color: PADS[decisionRef.current.padIdx].color, fontWeight: 600 }}>{decisionRef.current.label}</span>
-                    <span style={{ color: "#fbbf24" }}>{fmt$(decisionRef.current.betAmount)}</span>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-          {isMobile ? (
-            <div
-              data-testid="touch-zone"
-              onTouchStart={handleTouchZoneStart}
-              onTouchMove={handleTouchZoneMove}
-              onTouchEnd={handleTouchZoneEnd}
-              onTouchCancel={handleTouchZoneEnd}
-              style={{
-                width: "100%",
-                height: "120px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                background: "rgba(255,255,255,0.02)",
-                borderTop: "1px solid rgba(255,255,255,0.06)",
-                userSelect: "none",
-                WebkitTapHighlightColor: "transparent",
-                touchAction: "none",
-                position: "relative",
-              }}
-            >
-              <div style={{ textAlign: "center", pointerEvents: "none" }}>
-                <div style={{ fontSize: "13px", color: "#64748b", marginBottom: "6px" }}>
-                  Touch &amp; hold to thrust · Slide to steer
-                </div>
-                <div style={{ display: "flex", justifyContent: "center", gap: "40px", fontSize: "22px", color: "#334155" }}>
-                  <span>←</span>
-                  <span style={{ color: "#475569" }}>▲</span>
-                  <span>→</span>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div data-testid="touch-controls" style={{ display: "flex", justifyContent: "center", gap: "12px", padding: "6px 0" }}>
+        {phase === "playing" && (
+          <>
+            <div style={{ position: "absolute", bottom: "8px", left: 0, right: 0, display: "flex", justifyContent: "center", gap: "12px", zIndex: 6, pointerEvents: "none" }}>
               {[ ["left", "←"], ["up", "▲"], ["right", "→"] ].map(([key, label]) => (
                 <button
                   key={key}
-                  data-testid={`button-${key}`}
                   onTouchStart={(e) => { e.preventDefault(); touchAction(key, true); }}
                   onTouchEnd={(e) => { e.preventDefault(); touchAction(key, false); }}
                   onMouseDown={() => touchAction(key, true)}
                   onMouseUp={() => touchAction(key, false)}
                   onMouseLeave={() => touchAction(key, false)}
                   style={{
-                    width: "48px",
-                    height: "48px",
+                    pointerEvents: "auto",
+                    width: "56px",
+                    height: "56px",
                     borderRadius: "50%",
                     border: "2px solid rgba(255,255,255,0.15)",
                     background: "rgba(255,255,255,0.06)",
                     color: "#cbd5e1",
-                    fontSize: "18px",
+                    fontSize: "20px",
                     cursor: "pointer",
                     display: "flex",
                     alignItems: "center",
@@ -1993,9 +1663,121 @@ export default function RocketLander({ onRoundComplete }) {
                 </button>
               ))}
             </div>
-          )}
-        </div>
-      )}
+            <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, display: "flex", justifyContent: "space-between", padding: "6px 14px", background: "rgba(6,8,15,0.88)", fontSize: "11px", zIndex: 5, fontFamily: "monospace" }}>
+              <span style={{ color: "#4ade80" }}>WEALTH: {fmt$(wealth)}</span>
+              <span style={{ color: "#fbbf24" }}>AT RISK: {fmt$(decisionRef.current?.betAmount || 0)}</span>
+              <span style={{ color: "#94a3b8" }}>γ {gamma.toFixed(1)} · edge {edge >= 0 ? "+" : ""}{edge.toFixed(2)}</span>
+            </div>
+          </>
+        )}
+
+        {phase === "result" && lastResult && (
+          <div style={overlayBase}>
+            <div style={{ fontSize: "11px", letterSpacing: "3px", color: lastResult.kind === "success" ? "#4ade80" : lastResult.kind === "miss" ? "#fbbf24" : "#ef4444", marginBottom: "6px" }}>
+              {lastResult.kind === "success" ? "MISSION FILLED" : lastResult.kind === "miss" ? "OFF-CONTRACT LANDING" : "CRASH"}
+            </div>
+            <h2 style={{ fontSize: "24px", margin: "0 0 8px", color: lastResult.pnl >= 0 ? "#4ade80" : "#fbbf24" }}>{fmtSigned$(lastResult.pnl)}</h2>
+            <div style={{ fontSize: "14px", color: "#94a3b8", marginBottom: "18px" }}>Wealth now <span style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmt$(lastResult.wealthAfter)}</span></div>
+
+            <div style={{ width: "100%", maxWidth: "460px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: "14px 16px", marginBottom: "16px" }}>
+              {summaryRow("Target mission", lastResult.targetLabel, PADS.find((p) => p.label === lastResult.targetLabel)?.color || "#e2e8f0")}
+              {summaryRow("Actual touchdown", lastResult.landedLabel)}
+              {summaryRow("Stake", fmt$(lastResult.betAmount), "#fbbf24")}
+              {summaryRow("Quoted success return", `+${(lastResult.profitMult * 100).toFixed(0)}%`)}
+              {summaryRow("Population hit-rate", fmtPct(lastResult.populationQ), "#94a3b8")}
+              {summaryRow("Quoted hit-rate", fmtPct(lastResult.marketQ))}
+              {summaryRow("Cash sleeve rf", fmtPct(lastResult.roundRf, 1), "#4ade80")}
+              {summaryRow("Promo over cash", `+${(lastResult.promoEdge * 100).toFixed(2)}%`, "#4ade80")}
+              {summaryRow("Touchdown speed", `${lastResult.speed.toFixed(2)} m/s`, lastResult.speed <= SAFE_V ? "#4ade80" : lastResult.speed <= HARD_V ? "#fbbf24" : "#ef4444")}
+              {lastResult.kind === "success" && summaryRow("Fuel bonus", fmt$(lastResult.fuelBonus), "#22c55e")}
+            </div>
+
+            <div style={{ maxWidth: "500px", fontSize: "13px", color: "#94a3b8", lineHeight: 1.6, marginBottom: "18px" }}>{lastInsight}</div>
+
+            <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
+              <button onClick={nextStep} style={btnStyle(lastResult.kind === "success" ? "#22c55e" : "#0ea5e9")}>{round >= MAX_ROUNDS || wealth < BANKRUPT_FLOOR ? "SEE PROFILE" : "NEXT ROUND"}</button>
+            </div>
+          </div>
+        )}
+
+        {phase === "profile" && (
+          <div style={{ ...overlayBase, paddingTop: "10px" }}>
+            <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#38bdf8", marginBottom: "6px" }}>SESSION COMPLETE</div>
+            <h2 style={{ fontSize: "24px", margin: "0 0 6px" }}>{fmt$(wealth)}</h2>
+            <div style={{ color: wealth >= START_WEALTH ? "#4ade80" : "#f87171", fontSize: "14px", marginBottom: "18px" }}>{wealth >= START_WEALTH ? "+" : ""}{fmt$(wealth - START_WEALTH)} vs starting wealth</div>
+
+            <div style={{ width: "100%", maxWidth: "650px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "12px" }}>
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: "14px", textAlign: "left" }}>
+                <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "6px" }}>RISK AVERSION POSTERIOR</div>
+                <div style={{ fontSize: "28px", fontWeight: 700, color: "#0ea5e9", marginBottom: "6px" }}>γ {gamma.toFixed(2)}</div>
+                <div style={{ fontSize: "13px", color: "#e2e8f0", fontWeight: 600, marginBottom: "4px" }}>{gammaProfile.title}</div>
+                <div style={{ fontSize: "12px", color: "#94a3b8", lineHeight: 1.5, marginBottom: "8px" }}>{gammaProfile.desc}</div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "6px" }}>95% CI {posteriorStats.gammaLo95.toFixed(1)} to {posteriorStats.gammaHi95.toFixed(1)}</div>
+                <DistributionStrip values={posteriorStats.gammaMarginal} color="#0ea5e9" />
+              </div>
+
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: "14px", textAlign: "left" }}>
+                <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "6px" }}>PERCEIVED EDGE / CONFIDENCE</div>
+                <div style={{ fontSize: "28px", fontWeight: 700, color: edge >= 0 ? "#f97316" : "#a78bfa", marginBottom: "6px" }}>{edge >= 0 ? "+" : ""}{edge.toFixed(2)}</div>
+                <div style={{ fontSize: "13px", color: "#e2e8f0", fontWeight: 600, marginBottom: "4px" }}>{edgeProfile.title}</div>
+                <div style={{ fontSize: "12px", color: "#94a3b8", lineHeight: 1.5, marginBottom: "8px" }}>{edgeProfile.desc}</div>
+                <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "6px" }}>95% CI {posteriorStats.edgeLo95.toFixed(2)} to {posteriorStats.edgeHi95.toFixed(2)}</div>
+                <DistributionStrip values={posteriorStats.edgeMarginal} color={edge >= 0 ? "#f97316" : "#a78bfa"} />
+              </div>
+            </div>
+
+            <div style={{ width: "100%", maxWidth: "650px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", marginBottom: "16px" }}>
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "12px" }}>
+                <div style={{ fontSize: "11px", color: "#64748b" }}>Final skill</div>
+                <div style={{ fontSize: "24px", fontWeight: 700, color: "#22c55e" }}>{skill.toFixed(2)}</div>
+              </div>
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "12px" }}>
+                <div style={{ fontSize: "11px", color: "#64748b" }}>Peak wealth</div>
+                <div style={{ fontSize: "24px", fontWeight: 700, color: "#e2e8f0" }}>{fmt$(wealthPeak)}</div>
+              </div>
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "10px", padding: "12px" }}>
+                <div style={{ fontSize: "11px", color: "#64748b" }}>Local market obs</div>
+                <div style={{ fontSize: "24px", fontWeight: 700, color: "#e2e8f0" }}>{marketObs}</div>
+              </div>
+            </div>
+
+            <div style={{ width: "100%", maxWidth: "650px", background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b", borderRadius: "12px", padding: "14px", marginBottom: "18px" }}>
+              <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "8px", textAlign: "left" }}>ROUND LOG</div>
+              <div style={{ maxHeight: "190px", overflowY: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                  <thead>
+                    <tr style={{ color: "#64748b", textAlign: "left" }}>
+                      <th style={{ padding: "6px 4px" }}>R</th>
+                      <th style={{ padding: "6px 4px" }}>Mission</th>
+                      <th style={{ padding: "6px 4px" }}>Stake</th>
+                      <th style={{ padding: "6px 4px" }}>Outcome</th>
+                      <th style={{ padding: "6px 4px" }}>P&amp;L</th>
+                      <th style={{ padding: "6px 4px" }}>Wealth</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {roundHistory.map((r) => (
+                      <tr key={r.round} style={{ borderTop: "1px solid #1e293b" }}>
+                        <td style={{ padding: "6px 4px", color: "#94a3b8" }}>{r.round}</td>
+                        <td style={{ padding: "6px 4px" }}>{r.target}</td>
+                        <td style={{ padding: "6px 4px", color: "#fbbf24" }}>{fmt$(r.betAmount)}</td>
+                        <td style={{ padding: "6px 4px", color: r.outcome === "success" ? "#4ade80" : r.outcome === "miss" ? "#fbbf24" : "#f87171" }}>{r.outcome}</td>
+                        <td style={{ padding: "6px 4px", color: r.pnl >= 0 ? "#4ade80" : "#f87171" }}>{fmtSigned$(r.pnl)}</td>
+                        <td style={{ padding: "6px 4px" }}>{fmt$(r.wealthAfter)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+              <button onClick={startGame} style={btnStyle("#0ea5e9")}>RUN AGAIN</button>
+              <button onClick={resetLocalBook} style={btnStyle("#334155")}>RESET LOCAL BOOK</button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

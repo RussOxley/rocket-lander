@@ -28,7 +28,7 @@ export function GameWrapper() {
   }, [submitResult, toast]);
 
   return (
-    <div className="relative w-full h-[calc(100vh-8rem)] rounded-2xl overflow-hidden border border-white/10" data-testid="game-container">
+    <div className="w-full h-full" data-testid="game-container">
       <RocketLander onRoundComplete={handleRoundComplete} />
     </div>
   );

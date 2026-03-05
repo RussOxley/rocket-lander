@@ -14,6 +14,7 @@ The aesthetic is a dark "deep space" theme with neon cyan, purple, and pink acce
 - **HUD**: All flight telemetry (ALT, VEL, FUEL, round, wealth, risk) is displayed in a strip below the canvas, outside the gameplay area. Touch controls are also below the canvas.
 - **Bet Slider**: Uses a log10 scale to discourage excessive risk-taking. The mapping is `(10^(t*2) - 1) / 99 * 100` where t is the slider position (0-1). This means the first half of the slider covers ~0-10% bets, making it easy to pick conservative amounts while still allowing aggressive bets at the far end. Quick-pick buttons bypass the log scale for exact values.
 - **Market Book (Probability Model)**: Success probabilities are seeded from the PostgreSQL database on page load via `GET /api/market-book`. The endpoint aggregates actual game results grouped by exact `tier_idx` and `pad_idx` combinations, so each difficulty tier + landing pad pair has its own success/failure tally from real play history. In-session updates (after each round) still update the local state for immediate reactivity. The DB is the source of truth across sessions and browsers.
+- **Adversarial Skill Pricing**: As the game gains confidence in a player's skill (high clarity + skillMu > 0.52), it applies a `skillSurcharge` that compresses promoEdge (can go negative to -1.5%). This makes it harder for skilled players to find +EV bets, so an overconfident player who keeps sizing big into negative-EV pricing reveals exactly that overconfidence (edge parameter spikes positive in the posterior). The fuel bonus cap is also compressed for skilled players via `fuelSkillDiscount`.
 
 ---
 
@@ -43,12 +44,12 @@ This shared layer is key: API route paths, input schemas, and response shapes ar
 - **date-fns** for date formatting in History and Dashboard
 - Path alias `@/` maps to `client/src/`, `@shared/` maps to `shared/`
 
-The app layout is a fixed sidebar (`Sidebar.tsx`) + scrollable main area. The sidebar uses Framer Motion's `layoutId` for a smooth active-tab highlight animation.
+The app layout is full-viewport with no sidebar. A small hamburger menu button (top-left corner) opens a dropdown with navigation links (Play, Analytics, Flight Logs). The menu supports keyboard dismissal (Escape) and click-outside-to-close. The game fills the entire viewport height.
 
 Custom hooks in `client/src/hooks/`:
 - `use-game-results.ts` – wraps TanStack Query for `GET /api/game-results` and `POST /api/game-results`
 - `use-toast.ts` – in-memory toast notification state machine
-- `use-mobile.tsx` – responsive breakpoint detection
+- `use-mobile.tsx` – responsive breakpoint detection (note: the game component has its own `useIsMobile` hook using `useSyncExternalStore` for reactive resize tracking at 640px breakpoint)
 
 ### Backend Architecture
 - **Express 5** HTTP server

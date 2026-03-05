@@ -1,0 +1,39 @@
+1. Reset bet to 0%, not 20% (line 909)
+
+setBetPct(0);  // was 20
+Why: 20% is an anchor. Players unconsciously centre on it, compressing the variance in observed bet fractions — which is precisely the signal you need. Starting at 0% forces an active upward choice every round, which is more revealing.
+
+2. Show the explicit expected value of the bet on the planning screen
+Currently you show outcome previews but not EV. Add one row to the "Outcome Preview" panel:
+
+
+const evIfBet = quote.qQuote * selectedPreview.successWealth + (1 - quote.qQuote) * selectedPreview.failWealth;
+Display as: EV of this allocation: $XX,XXX
+
+Why: A calibrated player will size toward EV-maximising. An overconfident player will overbid relative to EV even when it's explicitly shown. A risk-averse player will underbid. Making EV explicit sharpens the behavioural contrast rather than confounding it with uncertainty about the maths.
+
+3. Overconfidence flag on the profile screen
+Currently the profile shows gamma and edge posteriors but doesn't call out the combination. Add a warning block when edgeMean > 0.12 AND gammaMean < 2.0:
+
+
+"High confidence + low caution: you sized bets as if your hit-rate was materially 
+better than the market's estimate. In financial modelling this flags overconfidence 
+risk — the tendency to underprice downside when you feel skilled."
+And conversely when edgeMean < -0.12: an underconfidence note. Why: This is the stated purpose of the instrument — the profile page should translate the posterior into a plain-language financial modelling interpretation, not just report numbers.
+
+4. Fully randomise the round order (line 556–563)
+
+function genRoundOrder() {
+  const tiers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  for (let i = tiers.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [tiers[i], tiers[j]] = [tiers[j], tiers[i]];
+  }
+  return tiers;
+}
+Why: Currently tier 0 (easiest) is always round 1 and tier 9 (hardest) always round 10. This means the player is always fresh and optimistic on easy bets, and always experienced (and possibly depleted) on the hardest one. That's a within-session learning confound. Full randomisation means the game sees the player's risk choices across the full difficulty range at varying wealth levels and mental states — much richer signal.
+
+5. Extend to 15 rounds
+Change MAX_ROUNDS = 15 and add 5 more entries to DIFF_TIERS (or repeat the middle tiers with slight variation).
+
+Why: The gamma posterior CI after 10 rounds is typically 1.5–2 wide (e.g., 1.2–3.8), which is too noisy for financial modelling use. 15 rounds roughly halves posterior variance. You could make the extra 5 rounds pull from tiers 3–7 (mid-range, most informative for separating gamma values).

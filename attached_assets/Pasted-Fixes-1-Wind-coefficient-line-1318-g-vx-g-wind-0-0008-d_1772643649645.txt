@@ -1,0 +1,42 @@
+Fixes
+1. Wind coefficient — line 1318
+
+
+g.vx += g.wind * 0.0008 * dt;   // current — imperceptible
+g.vx += g.wind * 0.0040 * dt;   // fix — 5× stronger, now requires active countering
+At tier 5+ the player will need genuine lateral corrections. At tier 9 they'll be fighting a real crosswind while also managing vertical speed.
+
+2. Gravity ceiling and fuel at top tiers
+
+The gravity jump from 0.008 to 0.031 is nearly 4× with thrust headroom of only 0.001. Pull back the top of the curve and give back some fuel:
+
+
+// Current
+{ gravity: 0.022, fuel: 70,  wind: 1.10, label: "Heavy Crosswind" },
+{ gravity: 0.025, fuel: 62,  wind: 1.30, label: "Storm Approach" },
+{ gravity: 0.028, fuel: 55,  wind: 1.60, label: "Severe Turbulence" },
+{ gravity: 0.031, fuel: 48,  wind: 1.80, label: "Hurricane Landing" },
+
+// Proposed — gravity tops out at 0.026, difficulty comes more from wind + fuel
+{ gravity: 0.021, fuel: 72,  wind: 1.40, label: "Heavy Crosswind" },
+{ gravity: 0.023, fuel: 65,  wind: 1.65, label: "Storm Approach" },
+{ gravity: 0.025, fuel: 60,  wind: 1.90, label: "Severe Turbulence" },
+{ gravity: 0.026, fuel: 56,  wind: 2.20, label: "Hurricane Landing" },
+This keeps tier 9 hard (more wind, less fuel than mid tiers) but gives ~0.006 net deceleration when thrusting — enough that a skilled player can actually manage a controlled descent with good fuel discipline.
+
+3. Optional — make wind gustier (line 1316)
+
+The current sinusoidal wind is completely predictable. A small noise term makes it feel real:
+
+
+// Current — smooth, learnable
+g.wind = g.windStr * (Math.sin(g.time * 0.008) + 0.6 * Math.sin(g.time * 0.031));
+
+// Proposed — add a slow-drift gust component
+g.wind = g.windStr * (Math.sin(g.time * 0.008) + 0.6 * Math.sin(g.time * 0.031) + 0.35 * Math.sin(g.time * 0.071 + g.windPhase));
+where windPhase is a random value assigned per-round in initRound: windPhase: Math.random() * Math.PI * 2. This gives each round a different wind character at the same tier, reducing the ability to memorise the rhythm.
+
+Net result
+Tiers 0–4: gravity manageable, wind starting to be felt from tier 2–3 upward
+Tiers 5–7: genuine two-axis challenge — vertical speed control AND lateral drift
+Tiers 8–9: still very hard but possible with good technique, which is what you want for the difficulty/reward calibration to mean something
